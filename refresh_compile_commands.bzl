@@ -28,28 +28,29 @@ refresh_compile_commands(
         # If you don't specify a target, that's fine (if it works for you); compile_commands.json will default to containing commands used in building all possible targets. But in that case, just bazel run @hedron_compile_commands//:refresh_all
         # Wildcard target patterns (..., *, :all) patterns are allowed, like in bazel build:
             # For more, see https://docs.bazel.build/versions/main/guide.html#specifying-targets-to-build
+    # Optionally substitution of the command with alternative e.g replace clang_wrapper.sh with the real path to the clang-13 binary. 
+    # when using the grailbio llvm toolchain.
+	# replace_command = {"external/llvm_toolchain/bin/cc_wrapper.sh":"external/llvm_toolchain_llvm/bin/clang-13"}
 )
 ```
 """
 
-
 ########################################
 # Implementation
 
-def refresh_compile_commands(name, targets = None):
+def refresh_compile_commands(name, targets = None, replace_commands = {}):
     # Convert the various, acceptable target shorthands into the dictionary format
-    if not targets: # Default to all targets in main workspace
+    if not targets:  # Default to all targets in main workspace
         targets = {"@//...": ""}
-    elif type(targets) == "list": # Allow specifying a list of targets w/o arguments
+    elif type(targets) == "list":  # Allow specifying a list of targets w/o arguments
         targets = {target: "" for target in targets}
-    elif type(targets) != "dict": # Assume they've supplied a single string/label and wrap it 
+    elif type(targets) != "dict":  # Assume they've supplied a single string/label and wrap it
         targets = {targets: ""}
 
     # Generate runnable python script from template
     script_name = name + ".py"
-    _expand_template(name = script_name, labels_to_flags = targets)
+    _expand_template(replace_commands = replace_commands, name = script_name, labels_to_flags = targets)
     native.py_binary(name = name, srcs = [script_name])
-
 
 def _expand_template_impl(ctx):
     """Inject targets of interest into refresh.template.py, and set it up to be run."""
@@ -58,14 +59,18 @@ def _expand_template_impl(ctx):
         output = script,
         is_executable = True,
         template = ctx.file._script_template,
-        substitutions = {"        {target_flag_pairs}": "\n".join(["        (%r, %r)," % p for p in ctx.attr.labels_to_flags.items()])} # Note, don't delete whitespace. Correctly doing multiline indenting.
+        substitutions = {
+            "        {target_flag_pairs}": "\n".join(["        (%r, %r)," % p for p in ctx.attr.labels_to_flags.items()]),
+            "        {replace_commands}": "\n".join(["        (%r, %r)," % p for p in ctx.attr.replace_commands.items()]),
+        },  # Note, don't delete whitespace. Correctly doing multiline indenting.
     )
     return DefaultInfo(files = depset([script]))
 
 _expand_template = rule(
     attrs = {
-        "labels_to_flags": attr.string_dict(mandatory = True), # string keys instead of label_keyed because Bazel doesn't support parsing wildcard target patterns (..., *, :all) in BUILD attributes.
-        "_script_template": attr.label(allow_single_file = True, default = "refresh.template.py")
+        "labels_to_flags": attr.string_dict(mandatory = True),  # string keys instead of label_keyed because Bazel doesn't support parsing wildcard target patterns (..., *, :all) in BUILD attributes.
+        "replace_commands": attr.string_dict(),
+        "_script_template": attr.label(allow_single_file = True, default = "refresh.template.py"),
     },
-    implementation = _expand_template_impl
+    implementation = _expand_template_impl,
 )

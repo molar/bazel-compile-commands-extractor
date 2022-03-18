@@ -10,12 +10,13 @@ Interface (after template expansion):
 """
 
 import sys
-if sys.version_info < (3,7):
-    sys.exit("\n\033[91mFATAL ERROR:\033[0m Python 3.7 or later is required. Please update!")
+if sys.version_info < (3, 7):
+    sys.exit(
+        "\n\033[91mFATAL ERROR:\033[0m Python 3.7 or later is required. Please update!"
+    )
     # 3.7 backwards compatibility required by @lummax in https://github.com/hedronvision/bazel-compile-commands-extractor/pull/27. Try to contact him before upgrading.
     # When adding things could be cleaner if we had a higher minimum version, please add a commend with  MIN_PY=3.<v>.
-    # Similarly, when upgrading, please search for that MIN_PY= tag. 
-
+    # Similarly, when upgrading, please search for that MIN_PY= tag.
 
 import concurrent.futures
 import functools
@@ -27,22 +28,22 @@ import re
 import shlex
 import subprocess
 import types
-import typing # MIN_PY=3.9: Switch e.g. typing.List[str] -> list[str]
+import typing  # MIN_PY=3.9: Switch e.g. typing.List[str] -> list[str]
 
 # Backport shlex.join (PY_MIN=3.8)
 if not hasattr(shlex, 'join'):
     shlex.join = lambda args: ' '.join(shlex.quote(arg) for arg in args)
 
-
 # OPTIMNOTE: Most of the runtime of this file--and the output file size--are working around https://github.com/clangd/clangd/issues/123. To work around we have to run clang's preprocessor on files to determine their headers and emit compile commands entries for those headers.
-# There is an optimization that would improve speed. We intentionally haven't done it because it has downsides and we anticipate that this problem will be temporary; clangd improves fast. 
-    # The simplest would be to only search for headers once per source file.
-        # Downside: We could miss headers conditionally included, e.g., by platform.
-        # Implementation: skip source files we've already seen in _get_files, shortcutting a bunch of slow preprocessor runs in _get_headers and output. We'd need a threadsafe set, or one set per thread, because header finding is already multithreaded for speed (same magnitudespeed win as single-threaded set).
-        # Anticipated speedup: ~2x (30s to 15s.)
+# There is an optimization that would improve speed. We intentionally haven't done it because it has downsides and we anticipate that this problem will be temporary; clangd improves fast.
+# The simplest would be to only search for headers once per source file.
+# Downside: We could miss headers conditionally included, e.g., by platform.
+# Implementation: skip source files we've already seen in _get_files, shortcutting a bunch of slow preprocessor runs in _get_headers and output. We'd need a threadsafe set, or one set per thread, because header finding is already multithreaded for speed (same magnitudespeed win as single-threaded set).
+# Anticipated speedup: ~2x (30s to 15s.)
 
 
-def _get_headers(compile_args: typing.List[str], source_path_for_sanity_check: typing.Optional[str] = None):
+def _get_headers(compile_args: typing.List[str],
+                 source_path_for_sanity_check: typing.Optional[str] = None):
     """Gets the headers used by a particular compile command.
 
     Relatively slow. Requires running the C preprocessor.
@@ -52,93 +53,130 @@ def _get_headers(compile_args: typing.List[str], source_path_for_sanity_check: t
     # Flags reference here: https://clang.llvm.org/docs/ClangCommandLineReference.html
 
     # As an alternative approach, you might consider trying to get the headers by inspecing the Middlemen actions in the aquery output, but I don't see a way to get just the ones actually #included--or an easy way to get the system headers--without invoking the preprocessor's header search logic.
-        # For more on this, see https://github.com/hedronvision/bazel-compile-commands-extractor/issues/5#issuecomment-1031148373
+    # For more on this, see https://github.com/hedronvision/bazel-compile-commands-extractor/issues/5#issuecomment-1031148373
 
     # Strip out existing dependency file generation that could interfere with ours.
     # Clang on Apple doesn't let later flags override earlier ones, unfortunately.
     # These flags are prefixed with M for "make", because that's their output format.
     # *-dependencies is the long form. And the output file is traditionally *.d
-    header_cmd = (arg for arg in compile_args
-        if not arg.startswith('-M') and not arg.endswith(('-dependencies', '.d')))
+    header_cmd = (arg for arg in compile_args if not arg.startswith('-M')
+                  and not arg.endswith(('-dependencies', '.d')))
 
     # Strip output flags. Apple clang tries to do a full compile if you don't.
     header_cmd = (arg for arg in header_cmd
-        if arg != '-o' and not arg.endswith('.o'))
+                  if arg != '-o' and not arg.endswith('.o'))
 
     # Dump system and user headers to stdout...in makefile format, tolerating missing (generated) files
     # Relies on our having made the workspace directory simulate the execroot with //external symlink
-    header_cmd = list(header_cmd) + ['--dependencies', '--print-missing-file-dependencies']
+    header_cmd = list(header_cmd) + [
+        '--dependencies', '--print-missing-file-dependencies'
+    ]
 
     header_search_process = subprocess.run(
         header_cmd,
         cwd=os.environ["BUILD_WORKSPACE_DIRECTORY"],
         capture_output=True,
         encoding='utf-8',
-        check=False, # We explicitly ignore errors and carry on.
+        check=False,  # We explicitly ignore errors and carry on.
     )
     headers_makefile_out = header_search_process.stdout
 
     # Tolerate failure gracefully--during editing the code may not compile!
-    print(header_search_process.stderr, file=sys.stderr, end='') # Captured with capture_output and dumped explicitly to avoid interlaced output.
-    if not headers_makefile_out: # Worst case, we couldn't get the headers,
+    print(
+        header_search_process.stderr, file=sys.stderr, end=''
+    )  # Captured with capture_output and dumped explicitly to avoid interlaced output.
+    if not headers_makefile_out:  # Worst case, we couldn't get the headers,
         return []
     # But often, we can get the headers, despite the error.
 
     # Parse the makefile output.
-    split = headers_makefile_out.replace('\\\n', '').split() # Undo shell line wrapping bc it's not consistent (depends on file name length)
-    assert split[0].endswith('.o:'), "Something went wrong in makefile parsing to get headers. Zeroth entry should be the object file. Output:\n" + headers_makefile_out
-    assert source_path_for_sanity_check is None or split[1].endswith(source_path_for_sanity_check), "Something went wrong in makefile parsing to get headers. First entry should be the source file. Output:\n" + headers_makefile_out
-    headers = split[2:] # Remove .o and source entries (since they're not headers). Verified above
-    headers = list(set(headers)) # Make unique. GCC sometimes emits duplicate entries https://github.com/hedronvision/bazel-compile-commands-extractor/issues/7#issuecomment-975109458
+    split = headers_makefile_out.replace('\\\n', '').split(
+    )  # Undo shell line wrapping bc it's not consistent (depends on file name length)
+    assert split[0].endswith(
+        '.o:'
+    ), "Something went wrong in makefile parsing to get headers. Zeroth entry should be the object file. Output:\n" + headers_makefile_out
+    assert source_path_for_sanity_check is None or split[1].endswith(
+        source_path_for_sanity_check
+    ), "Something went wrong in makefile parsing to get headers. First entry should be the source file. Output:\n" + headers_makefile_out
+    headers = split[
+        2:]  # Remove .o and source entries (since they're not headers). Verified above
+    headers = list(
+        set(headers)
+    )  # Make unique. GCC sometimes emits duplicate entries https://github.com/hedronvision/bazel-compile-commands-extractor/issues/7#issuecomment-975109458
 
     return headers
 
 
 def _get_files(compile_args: typing.List[str]):
     """Gets the ([source files], [header files]) clangd should be told the command applies to."""
-    source_files = [arg for arg in compile_args if arg.endswith(_get_files.source_extensions)]
+    source_files = [
+        arg for arg in compile_args
+        if arg.endswith(_get_files.source_extensions)
+    ]
 
     assert len(source_files) > 0, f"No sources detected in {compile_args}"
-    assert len(source_files) <= 1, f"Multiple sources detected. Might work, but needs testing, and unlikely to be right given bazel. CMD: {compile_args}"
+    assert len(
+        source_files
+    ) <= 1, f"Multiple sources detected. Might work, but needs testing, and unlikely to be right given bazel. CMD: {compile_args}"
 
     # Note: We need to apply commands to headers and sources.
     # Why? clangd currently tries to infer commands for headers using files with similar paths. This often works really poorly for header-only libraries. The commands should instead have been inferred from the source files using those libraries... See https://github.com/clangd/clangd/issues/123 for more.
     # When that issue is resolved, we can stop looking for headers and files can just be the single source file. Good opportunity to clean that out.
-    if source_files[0] in _get_files.assembly_source_extensions: # Assembly sources that are not preprocessed can't include headers
+    if source_files[
+            0] in _get_files.assembly_source_extensions:  # Assembly sources that are not preprocessed can't include headers
         return source_files, []
     header_files = _get_headers(compile_args, source_files[0])
 
     # Ambiguous .h headers need a language specified if they aren't C, or clangd will erroneously assume they are C
     # Will be resolved by https://reviews.llvm.org/D116167. Revert f24fc5e and test when that lands, presumably in clangd14.
     # See also: https://github.com/hedronvision/bazel-compile-commands-extractor/issues/12
-    if (any(header_file.endswith('.h') for header_file in header_files) 
-        and not source_files[0].endswith(_get_files.c_source_extensions)
-        and all(not arg.startswith('-x') and not arg.startswith('--language') and arg.lower() not in ('-objc', '-objc++') for arg in compile_args)):
+    if (any(header_file.endswith('.h') for header_file in header_files)
+            and not source_files[0].endswith(_get_files.c_source_extensions)
+            and all(
+                not arg.startswith('-x') and not arg.startswith('--language')
+                and arg.lower() not in ('-objc', '-objc++')
+                for arg in compile_args)):
         # Insert at front of (non executable) args, because the --language is only supposed to take effect on files listed thereafter
-        compile_args.insert(1, _get_files.extensions_to_language_args[os.path.splitext(source_files[0])[1]]) 
+        compile_args.insert(
+            1, _get_files.extensions_to_language_args[os.path.splitext(
+                source_files[0])[1]])
 
     return source_files, header_files
+
+
 # Setup extensions and flags for the whole C-language family.
-_get_files.c_source_extensions = ('.c',)
+_get_files.c_source_extensions = ('.c', )
 _get_files.cpp_source_extensions = ('.cc', '.cpp', '.cxx', '.c++', '.C')
-_get_files.objc_source_extensions = ('.m',)
-_get_files.objcpp_source_extensions = ('.mm',)
-_get_files.cuda_source_extensions = ('.cu',)
-_get_files.opencl_source_extensions = ('.cl',)
+_get_files.objc_source_extensions = ('.m', )
+_get_files.objcpp_source_extensions = ('.mm', )
+_get_files.cuda_source_extensions = ('.cu', )
+_get_files.opencl_source_extensions = ('.cl', )
 _get_files.assembly_source_extensions = ('.s', '.asm')
-_get_files.assembly_needing_c_preprocessor_source_extensions = ('.S',)
+_get_files.assembly_needing_c_preprocessor_source_extensions = ('.S', )
 _get_files.source_extensions = _get_files.c_source_extensions + _get_files.cpp_source_extensions + _get_files.objc_source_extensions + _get_files.objcpp_source_extensions + _get_files.cuda_source_extensions + _get_files.opencl_source_extensions + _get_files.assembly_source_extensions + _get_files.assembly_needing_c_preprocessor_source_extensions
 _get_files.extensions_to_language_args = {
-    _get_files.c_source_extensions: '--language=c',
-    _get_files.cpp_source_extensions: '--language=c++',
-    _get_files.objc_source_extensions: '-ObjC',
-    _get_files.objcpp_source_extensions: '-ObjC++',
-    _get_files.cuda_source_extensions: '--language=cuda',
-    _get_files.opencl_source_extensions: '--language=cl',
-    _get_files.assembly_source_extensions: '--language=assembler',
-    _get_files.assembly_needing_c_preprocessor_source_extensions: '--language=assembler-with-cpp',
+    _get_files.c_source_extensions:
+    '--language=c',
+    _get_files.cpp_source_extensions:
+    '--language=c++',
+    _get_files.objc_source_extensions:
+    '-ObjC',
+    _get_files.objcpp_source_extensions:
+    '-ObjC++',
+    _get_files.cuda_source_extensions:
+    '--language=cuda',
+    _get_files.opencl_source_extensions:
+    '--language=cl',
+    _get_files.assembly_source_extensions:
+    '--language=assembler',
+    _get_files.assembly_needing_c_preprocessor_source_extensions:
+    '--language=assembler-with-cpp',
 }
-_get_files.extensions_to_language_args = {ext : flag for exts, flag in _get_files.extensions_to_language_args.items() for ext in exts} # Flatten map for easier use
+_get_files.extensions_to_language_args = {
+    ext: flag
+    for exts, flag in _get_files.extensions_to_language_args.items()
+    for ext in exts
+}  # Flatten map for easier use
 
 
 @functools.lru_cache(maxsize=None)
@@ -167,7 +205,8 @@ def _get_apple_platform(compile_args: typing.List[str]):
 @functools.lru_cache(maxsize=None)
 def _get_apple_DEVELOPER_DIR():
     """Get path to xcode-select'd developer directory."""
-    return subprocess.check_output(('xcode-select', '--print-path'), encoding='utf-8').rstrip()
+    return subprocess.check_output(('xcode-select', '--print-path'),
+                                   encoding='utf-8').rstrip()
     # Unless xcode-select has been invoked (like for a beta) we'd expect '/Applications/Xcode.app/Contents/Developer' from xcode-select -p
     # Traditionally stored in DEVELOPER_DIR environment variable, but not provided.
 
@@ -175,7 +214,8 @@ def _get_apple_DEVELOPER_DIR():
 @functools.lru_cache(maxsize=None)
 def _get_apple_active_clang():
     """Get path to xcode-select'd clang version."""
-    return subprocess.check_output(('xcrun', '--find', 'clang'), encoding='utf-8').rstrip()
+    return subprocess.check_output(('xcrun', '--find', 'clang'),
+                                   encoding='utf-8').rstrip()
     # Unless xcode-select has been invoked (like for a beta) we'd expect '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang' from xcrun -f clang
 
 
@@ -186,24 +226,35 @@ def _apple_platform_patch(compile_args: typing.List[str]):
     """
     compile_args = list(compile_args)
     # Bazel internal environment variable fragment that distinguishes Apple platforms that need unwrapping.
-        # Note that this occurs in the Xcode-installed wrapper, but not the CommandLineTools wrapper, which works fine as is. 
+    # Note that this occurs in the Xcode-installed wrapper, but not the CommandLineTools wrapper, which works fine as is.
     if any('__BAZEL_XCODE_' in arg for arg in compile_args):
         # Undo Bazel's Apple platform compiler wrapping.
         # Bazel wraps the compiler as `external/local_config_cc/wrapped_clang` and exports that wrapped compiler in the proto, and we need a clang call that clangd can introspect. (See notes in "how clangd uses compile_commands.json" in ImplementationReadme.md for more.)
         # It's also important because Bazel's Xcode (but not CommandLineTools) wrapper crashes if you don't specify particular environment variables (replaced below).
-        # When https://github.com/clangd/clangd/issues/123 is resolved, we might be able to remove this line without causing crashes or missing standard library or system framework red squigglies, since clangd is able to work correctly through other wrappers, like the CommandLineTools wrapper or the llvm wrappers. But currently, it's critical for being able to invoking the command to get headers without depending on environment variables. Still, it probably makes sense to leave it so the commands in compile_commands.json are invokable independent of Bazel. 
+        # When https://github.com/clangd/clangd/issues/123 is resolved, we might be able to remove this line without causing crashes or missing standard library or system framework red squigglies, since clangd is able to work correctly through other wrappers, like the CommandLineTools wrapper or the llvm wrappers. But currently, it's critical for being able to invoking the command to get headers without depending on environment variables. Still, it probably makes sense to leave it so the commands in compile_commands.json are invokable independent of Bazel.
         compile_args[0] = _get_apple_active_clang()
 
         # We have to manually substitute out Bazel's macros so clang can parse the command
         # Code this mirrors is in https://github.com/bazelbuild/bazel/blob/master/tools/osx/crosstool/wrapped_clang.cc
         # Not complete--we're just swapping out the essentials, because there seems to be considerable turnover in the hacks they have in the wrapper.
-        compile_args = [arg.replace('DEBUG_PREFIX_MAP_PWD', "-fdebug-prefix-map="+os.getcwd()) for arg in compile_args]
+        compile_args = [
+            arg.replace('DEBUG_PREFIX_MAP_PWD',
+                        "-fdebug-prefix-map=" + os.getcwd())
+            for arg in compile_args
+        ]
         # We also have to manually figure out the values of SDKROOT and DEVELOPER_DIR, since they're missing from the environment variables Bazel provides.
         # Filed Bazel issue about the missing environment variables: https://github.com/bazelbuild/bazel/issues/12852
-        compile_args = [arg.replace('__BAZEL_XCODE_DEVELOPER_DIR__', _get_apple_DEVELOPER_DIR()) for arg in compile_args]
+        compile_args = [
+            arg.replace('__BAZEL_XCODE_DEVELOPER_DIR__',
+                        _get_apple_DEVELOPER_DIR()) for arg in compile_args
+        ]
         apple_platform = _get_apple_platform(compile_args)
         assert apple_platform, f"Apple platform not detected in CMD: {compile_args}"
-        compile_args = [arg.replace('__BAZEL_XCODE_SDKROOT__', _get_apple_SDKROOT(apple_platform)) for arg in compile_args]
+        compile_args = [
+            arg.replace('__BAZEL_XCODE_SDKROOT__',
+                        _get_apple_SDKROOT(apple_platform))
+            for arg in compile_args
+        ]
 
     return compile_args
 
@@ -214,12 +265,14 @@ def _all_platform_patch(compile_args: typing.List[str]):
     # Without this fix, you get tons of module caches dumped into the VSCode root folder.
     # Filed clangd issue at: https://github.com/clangd/clangd/issues/655
     # Seems to have disappeared when we switched to aquery from action_listeners, but we'll leave it in until the bug is patched in case we start using C++ modules
-    compile_args = (arg for arg in compile_args if not arg.startswith('-fmodules-cache-path=bazel-out/'))
+    compile_args = (arg for arg in compile_args
+                    if not arg.startswith('-fmodules-cache-path=bazel-out/'))
 
     # When Bazel builds with gcc it adds -fno-canonical-system-headers to the command line, which clang tooling chokes on, since it does not understand this flag.
     # We'll remove this flag, until such time as clangd & clang-tidy gracefully ignore it. Tracking issue: https://github.com/clangd/clangd/issues/1004.
     # For more context see: https://github.com/hedronvision/bazel-compile-commands-extractor/issues/21
-    compile_args = (arg for arg in compile_args if not arg == '-fno-canonical-system-headers')
+    compile_args = (arg for arg in compile_args
+                    if not arg == '-fno-canonical-system-headers')
 
     # Any other general fixes would go here...
 
@@ -232,6 +285,16 @@ def _get_cpp_command_for_files(compile_action):
     Undo Bazel-isms and figures out which files clangd should apply the command to.
     """
     args = compile_action.arguments
+    replace_commands = [
+        # Begin: Template filled by Bazel
+        {replace_commands}
+        # End: Command template filled by Bazel
+    ]
+
+    if args:
+        for cmd, replace_command in replace_commands:
+            if args[0] == cmd:
+                args[0] = replace_command
 
     # Patch command by platform
     args = _all_platform_patch(args)
@@ -239,7 +302,8 @@ def _get_cpp_command_for_files(compile_action):
     # Android and Linux and grailbio LLVM toolchains: Fine as is; no special patching needed.
 
     source_files, header_files = _get_files(args)
-    command = shlex.join(args) # Reformat options as command string, escaping spaces
+    command = shlex.join(
+        args)  # Reformat options as command string, escaping spaces
     return source_files, header_files, command
 
 
@@ -255,10 +319,12 @@ def _convert_compile_commands(aquery_output):
 
     # Process each action from Bazelisms -> file paths and their clang commands
     # Threads instead of processes because most of the execution time is farmed out to subprocesses. No need to sidestep the GIL. Might change after https://github.com/clangd/clangd/issues/123 resolved
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(32, (os.cpu_count() or 1) + 4) # Backport. Default in MIN_PY=3.8. See "using very large resources implicitly on many-core machines" in https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor
-    ) as threadpool:
-        outputs = threadpool.map(_get_cpp_command_for_files, aquery_output.actions)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(
+            32, (os.cpu_count() or 1) + 4
+    )  # Backport. Default in MIN_PY=3.8. See "using very large resources implicitly on many-core machines" in https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor
+                                               ) as threadpool:
+        outputs = threadpool.map(_get_cpp_command_for_files,
+                                 aquery_output.actions)
 
     # Yield as compile_commands.json entries
     header_file_entries_written = set()
@@ -269,7 +335,9 @@ def _convert_compile_commands(aquery_output):
         # Without this, we emit an entry for each header for each time it is included, which is explosively duplicative--the same reason why C++ compilation is slow and the impetus for the new modules.
         # Revert when https://github.com/clangd/clangd/issues/123 is solved, which would remove the need to emit headers, because clangd would take on that work.
         # If https://github.com/clangd/clangd/issues/681, we'd probably want to find a way to filter to one entry per platform.
-        header_files = [h for h in header_files if h not in header_file_entries_written]
+        header_files = [
+            h for h in header_files if h not in header_file_entries_written
+        ]
         header_file_entries_written.update(header_files)
 
         for file in itertools.chain(source_files, header_files):
@@ -284,7 +352,8 @@ def _convert_compile_commands(aquery_output):
 def _get_commands(target: str, flags: str):
     """Yields compile_commands.json entries for a given target and flags, gracefully tolerating errors."""
     # Log clear completion messages
-    print(f"\033[0;34m>>> Analyzing commands used in {target}\033[0m", file=sys.stderr)
+    print(f"\033[0;34m>>> Analyzing commands used in {target}\033[0m",
+          file=sys.stderr)
 
     # First, query Bazel's C-family compile actions for that configured target
     aquery_args = [
@@ -306,9 +375,9 @@ def _get_commands(target: str, flags: str):
         cwd=os.environ["BUILD_WORKSPACE_DIRECTORY"],
         capture_output=True,
         encoding='utf-8',
-        check=False, # We explicitly ignore errors from `bazel aquery` and carry on.
+        check=
+        False,  # We explicitly ignore errors from `bazel aquery` and carry on.
     )
-
 
     # Filter aquery error messages to just those the user should care about.
     for line in aquery_process.stderr.splitlines():
@@ -320,25 +389,30 @@ def _get_commands(target: str, flags: str):
 
         print(line, file=sys.stderr)
 
-
     # Parse proto output from aquery
     try:
         # object_hook -> SimpleNamespace allows object.member syntax, like a proto, while avoiding the protobuf dependency
-        parsed_aquery_output = json.loads(aquery_process.stdout, object_hook=lambda d: types.SimpleNamespace(**d))
+        parsed_aquery_output = json.loads(
+            aquery_process.stdout,
+            object_hook=lambda d: types.SimpleNamespace(**d))
         # Further mimic a proto by protecting against the case where there are no actions found.
         # Otherwise, SimpleNamespace, unlike a real proto, won't create an actions attribute, leading to an AttributeError on access.
         if not hasattr(parsed_aquery_output, "actions"):
             parsed_aquery_output.actions = []
     except json.JSONDecodeError:
-        print("aquery failed. Command:", shlex.join(aquery_args), file=sys.stderr)
-        print(f"\033[0;32m>>> Failed extracting commands for {target}\n    Continuing gracefully...\033[0m",  file=sys.stderr)
+        print("aquery failed. Command:",
+              shlex.join(aquery_args),
+              file=sys.stderr)
+        print(
+            f"\033[0;32m>>> Failed extracting commands for {target}\n    Continuing gracefully...\033[0m",
+            file=sys.stderr)
         return
 
     yield from _convert_compile_commands(parsed_aquery_output)
 
-
     # Log clear completion messages
-    print(f"\033[0;32m>>> Finished extracting commands for {target}\033[0m", file=sys.stderr)
+    print(f"\033[0;32m>>> Finished extracting commands for {target}\033[0m",
+          file=sys.stderr)
 
 
 if __name__ == "__main__":
@@ -347,16 +421,19 @@ if __name__ == "__main__":
         {target_flag_pairs}
         # End: Command template filled by Bazel
     ]
+
     compile_command_entries = []
+
     for (target, flags) in target_flag_pairs:
         compile_command_entries.extend(_get_commands(target, flags))
 
     # Chain output into compile_commands.json
-    workspace_root = pathlib.Path(os.environ["BUILD_WORKSPACE_DIRECTORY"]) # Set by `bazel run`
+    workspace_root = pathlib.Path(
+        os.environ["BUILD_WORKSPACE_DIRECTORY"])  # Set by `bazel run`
     with open(workspace_root / "compile_commands.json", "w") as output_file:
         json.dump(
             compile_command_entries,
-            output_file, 
-            indent=2, # Yay, human readability!
-            check_circular=False # For speed.
+            output_file,
+            indent=2,  # Yay, human readability!
+            check_circular=False  # For speed.
         )
